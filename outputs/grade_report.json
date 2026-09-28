@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-28T02:52:02.705266+00:00",
+  "generated_at": "2026-09-28T04:22:09.919544+00:00",
   "submission_dir": "D:\\downloads\\Git\\K4-L3-DAY11-NguyenDucThinh-2A202602468-Guardrails-HITL-Responsible-AI",
   "technical_failure": false,
   "packaging": {
@@ -39,15 +39,15 @@
     "red_team": {
       "llm_provider": "openai",
       "llm_model": "gpt-4o-mini",
-      "unsafe_leaks": 5,
-      "unsafe_total": 6,
-      "guards_leaks": 0,
-      "guards_total": 6
+      "unsafe_leaks": 15,
+      "unsafe_total": 19,
+      "guards_leaks": 1,
+      "guards_total": 19
     }
   },
   "public_tests": {
     "returncode": 0,
-    "stdout": "..........                                                               [100%]\n10 passed in 1.20s\n",
+    "stdout": "..........                                                               [100%]\n10 passed in 1.05s\n",
     "stderr": "",
     "technical_failure": false
   },
