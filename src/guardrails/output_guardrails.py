@@ -27,6 +27,24 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+# Credentials / internal infrastructure — leaking any of these = block the reply.
+# Order matters: specific secrets are redacted before generic PII patterns.
+SECRET_PATTERNS = {
+    "api_key": r"\bsk-[a-zA-Z0-9_-]{6,}",
+    "password": r"\b(?:password|passwd|pwd|passcode|mật\s*khẩu|mat\s*khau)\b\s*(?:is|là|la|[:=])\s*[\"'`]?[^\s\"'`,;]+",
+    "admin_credential": r"\badmin\d{2,}\b",
+    "internal_host": r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d{2,5})?\b",
+    "connection_string": r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://\S+",
+}
+
+# Personal data — redact but the rest of the reply can still be delivered.
+PII_PATTERNS = {
+    "email": r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-zA-Z]{2,}",
+    "vn_phone": r"(?<![\d\w])(?:\+84|0)(?:[\s.-]?\d){9,10}(?!\d)",
+    "national_id": r"(?<!\d)(?:\d{12}|\d{9})(?!\d)",
+}
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -37,20 +55,10 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    for name, pattern in {**SECRET_PATTERNS, **PII_PATTERNS}.items():
+        matches = re.findall(pattern, redacted, re.IGNORECASE)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
@@ -60,6 +68,11 @@ def content_filter(response: str) -> dict:
         "issues": issues,
         "redacted": redacted,
     }
+
+
+def has_secret_issue(issues: list[str]) -> bool:
+    """True if any issue comes from SECRET_PATTERNS (credential leak, not just PII)."""
+    return any(issue.split(":", 1)[0] in SECRET_PATTERNS for issue in issues)
 
 
 # ============================================================
@@ -140,6 +153,12 @@ async def llm_safety_check(response_text: str) -> dict:
 #   - Return the (possibly modified) llm_response, or None to keep original
 # ============================================================
 
+SAFE_REFUSAL = (
+    "I'm sorry, I cannot share internal system details. "
+    "I can help you with accounts, transfers, savings, loans and credit cards."
+)
+
+
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""
 
@@ -149,6 +168,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_action: str | None = None  # None | "redacted" | "blocked"
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -167,21 +188,41 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     ):
         """Check LLM response before sending to user."""
         self.total_count += 1
+        self.last_action = None
+        self.last_issues = []
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Regex filter: secrets → block whole reply; PII only → redact
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.last_issues = result["issues"]
+            if has_secret_issue(result["issues"]):
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                llm_response.content = self._as_content(SAFE_REFUSAL)
+                return llm_response
+            self.redacted_count += 1
+            self.last_action = "redacted"
+            llm_response.content = self._as_content(result["redacted"])
+            response_text = result["redacted"]
 
-        return llm_response  # TODO: modify if needed
+        # 2. Optional LLM-as-Judge (off by default in this lab)
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                self.last_issues.append(f"judge: {verdict['verdict'][:80]}")
+                llm_response.content = self._as_content(SAFE_REFUSAL)
+
+        return llm_response
+
+    @staticmethod
+    def _as_content(text: str) -> types.Content:
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
 
 
 # ============================================================
